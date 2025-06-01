@@ -1,32 +1,32 @@
-/*#include <iostream>
-#include <boost/asio.hpp>
-
-int main(int argc, char* argv[]) {
-    return 0;
-}
-*/
-
 #include <iostream>
-#include <boost/asio.hpp>
 #include <fstream>
-#include <ctime>
+#include <sstream>
+#include <string>
 #include <vector>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <algorithm>
+#include <ctime>
+#include <iomanip>
+#include <boost/asio.hpp>
 
 using boost::asio::ip::tcp;
 
-// Definição da estrutura do registro de log
+// ===== ESTRUTURA DE DADOS =====
+
+// Estrutura do registro de log - definida conforme especificação
 #pragma pack(push, 1)
 struct LogRecord {
-    char sensor_id[32];      // ID do sensor (máx 32 caracteres)
+    char sensor_id[32];      // ID do sensor (máximo 32 caracteres)
     std::time_t timestamp;   // Timestamp UNIX
-    double value;            // Valor da leitura
+    double value;            // Valor da leitura do sensor
 };
 #pragma pack(pop)
 
-// Conversão de string para time_t
+// ===== FUNÇÕES UTILITÁRIAS =====
+
+// Converte string de data/hora para timestamp UNIX
 std::time_t string_to_time_t(const std::string& time_string) {
     std::tm tm = {};
     std::istringstream ss(time_string);
@@ -34,7 +34,7 @@ std::time_t string_to_time_t(const std::string& time_string) {
     return std::mktime(&tm);
 }
 
-// Conversão de time_t para string
+// Converte timestamp UNIX para string de data/hora
 std::string time_t_to_string(std::time_t time) {
     std::tm* tm = std::localtime(&time);
     std::ostringstream ss;
@@ -42,167 +42,316 @@ std::string time_t_to_string(std::time_t time) {
     return ss.str();
 }
 
-// Classe para gerenciar sessões de conexão
-class session : public std::enable_shared_from_this<session> {
-public:
-    session(tcp::socket socket) : socket_(std::move(socket)) {}
+// Divide uma string usando um delimitador
+std::vector<std::string> split_string(const std::string& str, char delimiter) {
+    std::vector<std::string> parts;
+    std::stringstream ss(str);
+    std::string part;
     
-    void start() {
-        do_read();
+    while (std::getline(ss, part, delimiter)) {
+        parts.push_back(part);
     }
+    
+    return parts;
+}
 
+// ===== GERENCIADOR DE ARQUIVOS DE LOG =====
+
+class LogFileManager {
 private:
-    void do_read() {
-        auto self(shared_from_this());
-        socket_.async_read_some(boost::asio::buffer(data_, max_length),
-            [this, self](boost::system::error_code ec, std::size_t length) {
-                if (!ec) {
-                    process_message(length);
-                    do_read();
-                }
-            });
-    }
-
-    void process_message(std::size_t length) {
-        std::string message(data_, length);
+    std::mutex file_mutex_;  // Mutex para acesso thread-safe aos arquivos
+    
+public:
+    // Escreve um registro de log no arquivo específico do sensor
+    bool write_log_record(const LogRecord& record) {
+        std::lock_guard<std::mutex> lock(file_mutex_);
         
-        // Verifica se a mensagem termina com \r\n
-        if (message.size() < 2 || message.substr(message.size()-2) != "\r\n") {
-            // Mensagem inválida - ignorar ou enviar erro
-            return;
+        std::string filename = "sensor_" + std::string(record.sensor_id) + ".bin";
+        std::ofstream file(filename, std::ios::binary | std::ios::app);
+        
+        if (!file.is_open()) {
+            std::cerr << "Erro ao abrir arquivo de log: " << filename << std::endl;
+            return false;
         }
         
-        // Remove \r\n do final
-        message = message.substr(0, message.size()-2);
+        file.write(reinterpret_cast<const char*>(&record), sizeof(record));
+        file.close();
         
-        // Divide a mensagem em partes
-        std::vector<std::string> parts;
-        size_t pos = 0;
-        while ((pos = message.find('|')) != std::string::npos) {
-            parts.push_back(message.substr(0, pos));
-            message.erase(0, pos + 1);
-        }
-        parts.push_back(message);
+        std::cout << "Log gravado - Sensor: " << record.sensor_id 
+                  << ", Valor: " << record.value 
+                  << ", Timestamp: " << time_t_to_string(record.timestamp) << std::endl;
         
-        if (parts.empty()) return;
-        
-        if (parts[0] == "LOG") {
-            // Processar mensagem de log
-            if (parts.size() == 4) {
-                handle_log_message(parts[1], parts[2], parts[3]);
-            }
-        } else if (parts[0] == "GET") {
-            // Processar solicitação de dados
-            if (parts.size() == 3) {
-                handle_get_message(parts[1], std::stoi(parts[2]));
-            }
-        }
+        return true;
     }
     
-    void handle_log_message(const std::string& sensor_id, const std::string& timestamp, const std::string& value) {
-        try {
-            // Criar registro de log
-            LogRecord record;
-            strncpy(record.sensor_id, sensor_id.c_str(), sizeof(record.sensor_id));
-            record.timestamp = string_to_time_t(timestamp);
-            record.value = std::stod(value);
-            
-            // Escrever no arquivo de log
-            std::string filename = "sensor_" + sensor_id + ".bin";
-            std::ofstream file(filename, std::ios::binary | std::ios::app);
-            if (file) {
-                file.write(reinterpret_cast<char*>(&record), sizeof(record));
-            }
-        } catch (...) {
-            // Tratar erros de conversão
-        }
-    }
-    
-    void handle_get_message(const std::string& sensor_id, int num_records) {
+    // Lê os últimos N registros de um sensor específico
+    std::vector<LogRecord> read_last_records(const std::string& sensor_id, int num_records) {
+        std::lock_guard<std::mutex> lock(file_mutex_);
+        
         std::string filename = "sensor_" + sensor_id + ".bin";
         std::ifstream file(filename, std::ios::binary);
         
-        if (!file) {
-            // Sensor não encontrado
-            std::string response = "ERROR|INVALID_SENSOR_ID\r\n";
-            boost::asio::write(socket_, boost::asio::buffer(response));
-            return;
+        std::vector<LogRecord> records;
+        
+        if (!file.is_open()) {
+            std::cout << "Arquivo não encontrado para sensor: " << sensor_id << std::endl;
+            return records;  // Retorna vetor vazio se arquivo não existe
         }
         
-        // Ler todos os registros
-        std::vector<LogRecord> records;
+        // Lê todos os registros do arquivo
         LogRecord record;
         while (file.read(reinterpret_cast<char*>(&record), sizeof(record))) {
             records.push_back(record);
         }
         
-        // Determinar quantos registros retornar
-        int records_to_return = std::min(num_records, static_cast<int>(records.size()));
-        if (records_to_return <= 0) {
-            std::string response = "0;\r\n";
-            boost::asio::write(socket_, boost::asio::buffer(response));
+        file.close();
+        
+        // Retorna apenas os últimos N registros
+        if (records.size() > static_cast<size_t>(num_records)) {
+            records.erase(records.begin(), records.end() - num_records);
+        }
+        
+        std::cout << "Lidos " << records.size() << " registros para sensor: " << sensor_id << std::endl;
+        
+        return records;
+    }
+    
+    // Verifica se um sensor existe (se há arquivo de log para ele)
+    bool sensor_exists(const std::string& sensor_id) {
+        std::string filename = "sensor_" + sensor_id + ".bin";
+        std::ifstream file(filename);
+        return file.good();
+    }
+};
+
+// ===== CLASSE DE SESSÃO =====
+
+class Session : public std::enable_shared_from_this<Session> {
+private:
+    tcp::socket socket_;
+    boost::asio::streambuf buffer_;
+    LogFileManager& log_manager_;
+    
+public:
+    Session(tcp::socket socket, LogFileManager& log_manager)
+        : socket_(std::move(socket)), log_manager_(log_manager) {
+    }
+    
+    void start() {
+        std::cout << "Nova conexão estabelecida" << std::endl;
+        do_read();
+    }
+    
+private:
+    void do_read() {
+        auto self(shared_from_this());
+        
+        // Lê dados assincronamente até encontrar \r\n
+        boost::asio::async_read_until(socket_, buffer_, "\r\n",
+            [this, self](boost::system::error_code ec, std::size_t length) {
+                if (!ec) {
+                    process_message();
+                    do_read();  // Continua lendo mais mensagens
+                } else {
+                    std::cout << "Conexão encerrada: " << ec.message() << std::endl;
+                }
+            });
+    }
+    
+    void process_message() {
+        // Extrai a mensagem do buffer
+        std::istream is(&buffer_);
+        std::string message;
+        std::getline(is, message);
+        
+        // Remove \r se presente
+        if (!message.empty() && message.back() == '\r') {
+            message.pop_back();
+        }
+        
+        std::cout << "Mensagem recebida: " << message << std::endl;
+        
+        // Parse da mensagem usando delimitador |
+        std::vector<std::string> parts = split_string(message, '|');
+        
+        if (parts.empty()) {
+            std::cerr << "Mensagem vazia recebida" << std::endl;
             return;
         }
         
-        // Construir resposta
-        std::ostringstream response;
-        response << records_to_return << ";";
+        // Processa diferentes tipos de mensagem
+        if (parts[0] == "LOG") {
+            handle_log_message(parts);
+        } else if (parts[0] == "GET") {
+            handle_get_message(parts);
+        } else {
+            std::cerr << "Tipo de mensagem desconhecido: " << parts[0] << std::endl;
+        }
+    }
+    
+    void handle_log_message(const std::vector<std::string>& parts) {
+        // Formato esperado: LOG|SENSOR_ID|DATA_HORA|LEITURA
+        if (parts.size() != 4) {
+            std::cerr << "Formato inválido para mensagem LOG" << std::endl;
+            return;
+        }
         
-        // Pegar os últimos N registros
-        auto start = records.end() - records_to_return;
-        for (auto it = start; it != records.end(); ++it) {
-            if (it != start) response << ";";
-            response << time_t_to_string(it->timestamp) << "|" << it->value;
+        try {
+            // Cria o registro de log
+            LogRecord record;
+            
+            // Limpa o buffer e copia o ID do sensor (máximo 31 chars + null terminator)
+            memset(record.sensor_id, 0, sizeof(record.sensor_id));
+            strncpy(record.sensor_id, parts[1].c_str(), sizeof(record.sensor_id) - 1);
+            
+            // Converte timestamp
+            record.timestamp = string_to_time_t(parts[2]);
+            
+            // Converte valor
+            record.value = std::stod(parts[3]);
+            
+            // Salva o registro
+            log_manager_.write_log_record(record);
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Erro ao processar mensagem LOG: " << e.what() << std::endl;
+        }
+    }
+    
+    void handle_get_message(const std::vector<std::string>& parts) {
+        // Formato esperado: GET|SENSOR_ID|NUMERO_DE_REGISTROS
+        if (parts.size() != 3) {
+            std::cerr << "Formato inválido para mensagem GET" << std::endl;
+            send_error_response("INVALID_FORMAT");
+            return;
+        }
+        
+        try {
+            std::string sensor_id = parts[1];
+            int num_records = std::stoi(parts[2]);
+            
+            // Verifica se o sensor existe
+            if (!log_manager_.sensor_exists(sensor_id)) {
+                send_error_response("INVALID_SENSOR_ID");
+                return;
+            }
+            
+            // Lê os registros
+            std::vector<LogRecord> records = log_manager_.read_last_records(sensor_id, num_records);
+            
+            // Envia a resposta
+            send_records_response(records);
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Erro ao processar mensagem GET: " << e.what() << std::endl;
+            send_error_response("PROCESSING_ERROR");
+        }
+    }
+    
+    void send_error_response(const std::string& error_type) {
+        std::string response = "ERROR|" + error_type + "\r\n";
+        
+        auto self(shared_from_this());
+        boost::asio::async_write(socket_, boost::asio::buffer(response),
+            [this, self, response](boost::system::error_code ec, std::size_t /*length*/) {
+                if (ec) {
+                    std::cerr << "Erro ao enviar resposta de erro: " << ec.message() << std::endl;
+                } else {
+                    std::cout << "Resposta de erro enviada: " << response;
+                }
+            });
+    }
+    
+    void send_records_response(const std::vector<LogRecord>& records) {
+        // Formato: NUM_REGISTROS;DATA_HORA|LEITURA;...;DATA_HORA|LEITURA\r\n
+        std::ostringstream response;
+        response << records.size();
+        
+        for (const auto& record : records) {
+            response << ";" << time_t_to_string(record.timestamp) << "|" << record.value;
         }
         
         response << "\r\n";
         
-        // Enviar resposta
-        boost::asio::write(socket_, boost::asio::buffer(response.str()));
+        auto self(shared_from_this());
+        std::string response_str = response.str();
+        
+        boost::asio::async_write(socket_, boost::asio::buffer(response_str),
+            [this, self, response_str](boost::system::error_code ec, std::size_t /*length*/) {
+                if (ec) {
+                    std::cerr << "Erro ao enviar resposta: " << ec.message() << std::endl;
+                } else {
+                    std::cout << "Resposta enviada: " << response_str;
+                }
+            });
     }
-
-    tcp::socket socket_;
-    enum { max_length = 1024 };
-    char data_[max_length];
 };
 
-// Classe do servidor
-class server {
+// ===== CLASSE DO SERVIDOR =====
+
+class DataAcquisitionServer {
+private:
+    tcp::acceptor acceptor_;
+    LogFileManager log_manager_;
+    
 public:
-    server(boost::asio::io_context& io_context, short port)
+    DataAcquisitionServer(boost::asio::io_context& io_context, short port)
         : acceptor_(io_context, tcp::endpoint(tcp::v4(), port)) {
+        std::cout << "Servidor iniciado na porta " << port << std::endl;
         do_accept();
     }
-
+    
 private:
     void do_accept() {
         acceptor_.async_accept(
             [this](boost::system::error_code ec, tcp::socket socket) {
                 if (!ec) {
-                    std::make_shared<session>(std::move(socket))->start();
+                    // Cria nova sessão para cada conexão
+                    std::make_shared<Session>(std::move(socket), log_manager_)->start();
+                } else {
+                    std::cerr << "Erro ao aceitar conexão: " << ec.message() << std::endl;
                 }
+                
+                // Continua aceitando novas conexões
                 do_accept();
             });
     }
-
-    tcp::acceptor acceptor_;
 };
+
+// ===== FUNÇÃO PRINCIPAL =====
 
 int main(int argc, char* argv[]) {
     try {
         if (argc != 2) {
-            std::cerr << "Uso: " << argv[0] << " <porta>\n";
+            std::cerr << "Uso: " << argv[0] << " <porta>" << std::endl;
+            std::cerr << "Exemplo: " << argv[0] << " 9000" << std::endl;
             return 1;
         }
-
+        
+        // Converte a porta para inteiro
+        int port = std::atoi(argv[1]);
+        if (port <= 0 || port > 65535) {
+            std::cerr << "Porta inválida: " << port << std::endl;
+            return 1;
+        }
+        
+        // Cria o contexto de I/O assíncrono
         boost::asio::io_context io_context;
-        server s(io_context, std::atoi(argv[1]));
-
-        std::cout << "Servidor iniciado na porta " << argv[1] << std::endl;
+        
+        // Cria e inicia o servidor
+        DataAcquisitionServer server(io_context, port);
+        
+        std::cout << "Sistema de Aquisição de Dados iniciado!" << std::endl;
+        std::cout << "Aguardando conexões de sensores..." << std::endl;
+        std::cout << "Pressione Ctrl+C para encerrar" << std::endl;
+        
+        // Executa o loop de eventos assíncrono
         io_context.run();
+        
     } catch (std::exception& e) {
-        std::cerr << "Exceção: " << e.what() << "\n";
+        std::cerr << "Erro: " << e.what() << std::endl;
+        return 1;
     }
-
+    
     return 0;
 }
