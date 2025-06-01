@@ -1,23 +1,33 @@
 cmake_minimum_required(VERSION 3.10)
-project(data-aquisition-system)
+project(data-acquisition-system)
 
-# set C++ standard
+# Configurações do C++
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_THREAD_PREFER_PTHREAD ON)                                                                                                                                                                                                           
-set(THREADS_PREFER_PTHREAD_FLAG ON)                                                                                                                                                                                                           
-find_package(Threads REQUIRED)                                                                                                                                                                                                                
 
+# Configurações para threads
+set(CMAKE_THREAD_PREFER_PTHREAD ON)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 
-# find Boost
+# Encontra a biblioteca Boost
 find_package(Boost 1.65.1 REQUIRED COMPONENTS system)
 
-# include directories
+# Configurações de debug
+set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra")
+
+# Diretórios de include
 include_directories(${Boost_INCLUDE_DIRS} src)
 
-# target executable and its source files
+# Executável principal
 add_executable(das src/main.cpp)
 
-# link Boost libraries to the target executable
+# Link das bibliotecas
 target_link_libraries(das ${Boost_LIBRARIES})
-target_link_libraries(das  Threads::Threads)                                                                                                 
+target_link_libraries(das Threads::Threads)
+
+# Informações de build
+message(STATUS "Boost version: ${Boost_VERSION}")
+message(STATUS "Boost libraries: ${Boost_LIBRARIES}")
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
